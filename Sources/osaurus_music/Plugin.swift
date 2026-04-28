@@ -459,12 +459,12 @@ private let manifest = #"""
   "min_osaurus": "0.5.0",
   "capabilities": {
     "tools": [
-      {"id": "open_music", "description": "Open Apple Music app", "parameters": {"type": "object", "properties": {}}, "requirements": ["automation"], "permission_policy": "auto"},
-      {"id": "play", "description": "Resume or start music playback", "parameters": {"type": "object", "properties": {}}, "requirements": ["automation"], "permission_policy": "auto"},
-      {"id": "pause", "description": "Pause music playback", "parameters": {"type": "object", "properties": {}}, "requirements": ["automation"], "permission_policy": "auto"},
-      {"id": "next_track", "description": "Skip to the next track", "parameters": {"type": "object", "properties": {}}, "requirements": ["automation"], "permission_policy": "auto"},
-      {"id": "previous_track", "description": "Go to the previous track", "parameters": {"type": "object", "properties": {}}, "requirements": ["automation"], "permission_policy": "auto"},
-      {"id": "set_volume", "description": "Set volume level (0-100)", "parameters": {"type": "object", "properties": {"level": {"type": "integer", "description": "Volume level from 0 to 100"}}, "required": ["level"]}, "requirements": ["automation"], "permission_policy": "auto"},
+      {"id": "open_music", "description": "Open Apple Music app", "parameters": {"type": "object", "properties": {}}, "requirements": ["automation"], "permission_policy": "ask"},
+      {"id": "play", "description": "Resume or start music playback", "parameters": {"type": "object", "properties": {}}, "requirements": ["automation"], "permission_policy": "ask"},
+      {"id": "pause", "description": "Pause music playback", "parameters": {"type": "object", "properties": {}}, "requirements": ["automation"], "permission_policy": "ask"},
+      {"id": "next_track", "description": "Skip to the next track", "parameters": {"type": "object", "properties": {}}, "requirements": ["automation"], "permission_policy": "ask"},
+      {"id": "previous_track", "description": "Go to the previous track", "parameters": {"type": "object", "properties": {}}, "requirements": ["automation"], "permission_policy": "ask"},
+      {"id": "set_volume", "description": "Set volume level (0-100)", "parameters": {"type": "object", "properties": {"level": {"type": "integer", "description": "Volume level from 0 to 100"}}, "required": ["level"]}, "requirements": ["automation"], "permission_policy": "ask"},
       {"id": "get_current_track", "description": "Get currently playing track info", "parameters": {"type": "object", "properties": {}}, "requirements": ["automation"], "permission_policy": "auto"},
       {"id": "get_library_stats", "description": "Get library statistics (track and playlist counts)", "parameters": {"type": "object", "properties": {}}, "requirements": ["automation"], "permission_policy": "auto"},
       {"id": "list_playlists", "description": "List available playlists in the user's library", "parameters": {"type": "object", "properties": {"limit": {"type": "integer", "description": "Max playlists to return (default: 25)"}}}, "requirements": ["automation"], "permission_policy": "auto"},
