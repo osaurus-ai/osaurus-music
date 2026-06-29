@@ -2,20 +2,22 @@ import Foundation
 
 // MARK: - AppleScript Runner
 
-private struct AppleScriptRunner {
+struct AppleScriptRunner {
     enum RunnerError: Error {
         case musicNotRunning
         case permissionDenied
         case executionFailed(String)
-        
+
+        /// Canonical failure envelope for this error. Permission/not-running map to
+        /// `unavailable` with `retryable: false`; other failures map to `execution_error`.
         var jsonError: String {
             switch self {
             case .musicNotRunning:
-                return #"{"error": "Music app is not running. Please open Apple Music first."}"#
+                return Envelope.failure(.unavailable, "Music app is not running. Please open Apple Music first.", retryable: false)
             case .permissionDenied:
-                return #"{"error": "Automation permission denied. Grant Osaurus access in System Settings > Privacy & Security > Automation."}"#
+                return Envelope.failure(.unavailable, "Automation permission denied. Grant Osaurus access in System Settings > Privacy & Security > Automation.", retryable: false)
             case .executionFailed(let message):
-                return #"{"error": "Command failed: \#(message.escapedForJSON)"}"#
+                return Envelope.failure(.executionError, "Command failed: \(message)")
             }
         }
     }
@@ -79,11 +81,18 @@ private extension String {
             .replacingOccurrences(of: "\r", with: "\\r")
             .replacingOccurrences(of: "\t", with: "\\t")
     }
+
+    /// Escapes a string for safe interpolation inside an AppleScript string literal.
+    /// Backslash must be escaped first so we don't double-escape the quotes we add.
+    var escapedForAppleScript: String {
+        self.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+    }
 }
 
 // MARK: - Tool Protocol
 
-private protocol Tool {
+protocol Tool {
     var name: String { get }
     func run(args: String, runner: AppleScriptRunner) -> String
 }
@@ -124,10 +133,14 @@ private struct SetVolumeTool: Tool {
         
         guard let data = args.data(using: .utf8),
               let input = try? JSONDecoder().decode(Args.self, from: data) else {
-            return #"{"error": "Invalid arguments. Expected: {\"level\": 0-100}"}"#
+            return Envelope.failure(.invalidArgs, "Invalid arguments. Expected: {\"level\": 0-100}")
         }
-        
-        let level = max(0, min(100, input.level))
+
+        guard (0...100).contains(input.level) else {
+            return Envelope.failure(.invalidArgs, "Volume level must be between 0 and 100, got \(input.level).")
+        }
+
+        let level = input.level
         let script = #"tell application "Music" to set sound volume to \#(level)"#
         
         switch runner.run(script) {
@@ -160,7 +173,7 @@ private struct GetCurrentTrackTool: Tool {
             
             let parts = output.components(separatedBy: "|||")
             guard parts.count >= 6 else {
-                return #"{"error": "Failed to parse track information"}"#
+                return Envelope.failure(.executionError, "Failed to parse track information")
             }
             
             return """
@@ -187,7 +200,7 @@ private struct GetLibraryStatsTool: Tool {
         case .success(let output):
             let parts = output.components(separatedBy: "|||")
             guard parts.count >= 2 else {
-                return #"{"error": "Failed to parse library statistics"}"#
+                return Envelope.failure(.executionError, "Failed to parse library statistics")
             }
             return #"{"tracks": \#(parts[0]), "playlists": \#(parts[1])}"#
             
@@ -210,11 +223,15 @@ private struct SearchSongsTool: Tool {
         
         guard let data = args.data(using: .utf8),
               let input = try? JSONDecoder().decode(Args.self, from: data) else {
-            return #"{"error": "Invalid arguments. Expected: {\"query\": \"search term\"}"}"#
+            return Envelope.failure(.invalidArgs, "Invalid arguments. Expected: {\"query\": \"search term\"}")
         }
-        
+
+        guard !input.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return Envelope.failure(.invalidArgs, "Missing required argument 'query'.")
+        }
+
         let limit = input.limit ?? 10
-        let escapedQuery = input.query.replacingOccurrences(of: "\"", with: "\\\"")
+        let escapedQuery = input.query.escapedForAppleScript
         
         let script = """
         tell application "Music"
@@ -258,10 +275,14 @@ private struct PlaySongTool: Tool {
         
         guard let data = args.data(using: .utf8),
               let input = try? JSONDecoder().decode(Args.self, from: data) else {
-            return #"{"error": "Invalid arguments. Expected: {\"song\": \"song name\"}"}"#
+            return Envelope.failure(.invalidArgs, "Invalid arguments. Expected: {\"song\": \"song name\"}")
         }
-        
-        let escapedSong = input.song.replacingOccurrences(of: "\"", with: "\\\"")
+
+        guard !input.song.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return Envelope.failure(.invalidArgs, "Missing required argument 'song'.")
+        }
+
+        let escapedSong = input.song.escapedForAppleScript
         
         let script = """
         tell application "Music"
@@ -281,7 +302,7 @@ private struct PlaySongTool: Tool {
         switch runner.run(script) {
         case .success(let output):
             if output == "NOT_FOUND" {
-                return #"{"success": false, "error": "No song found matching '\#(input.song.escapedForJSON)'"}"#
+                return Envelope.failure(.notFound, "No song found matching '\(input.song)'")
             }
             
             let parts = output.components(separatedBy: "|||")
@@ -312,10 +333,14 @@ private struct PlayPlaylistTool: Tool {
         
         guard let data = args.data(using: .utf8),
               let input = try? JSONDecoder().decode(Args.self, from: data) else {
-            return #"{"error": "Invalid arguments. Expected: {\"playlist\": \"playlist name\"}"}"#
+            return Envelope.failure(.invalidArgs, "Invalid arguments. Expected: {\"playlist\": \"playlist name\"}")
         }
-        
-        let escapedPlaylist = input.playlist.replacingOccurrences(of: "\"", with: "\\\"")
+
+        guard !input.playlist.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return Envelope.failure(.invalidArgs, "Missing required argument 'playlist'.")
+        }
+
+        let escapedPlaylist = input.playlist.escapedForAppleScript
         let shuffleEnabled = input.shuffle ?? false
         
         let script = """
@@ -336,7 +361,7 @@ private struct PlayPlaylistTool: Tool {
         switch runner.run(script) {
         case .success(let output):
             if output == "NOT_FOUND" {
-                return #"{"success": false, "error": "Playlist '\#(input.playlist.escapedForJSON)' not found"}"#
+                return Envelope.failure(.notFound, "Playlist '\(input.playlist)' not found")
             }
             
             let parts = output.components(separatedBy: "|||")
@@ -394,9 +419,9 @@ private struct ListPlaylistsTool: Tool {
 
 // MARK: - Plugin Context
 
-private class PluginContext {
+class PluginContext {
     let runner = AppleScriptRunner()
-    
+
     let tools: [String: Tool] = {
         let toolList: [Tool] = [
             // Playback controls
@@ -422,7 +447,7 @@ private class PluginContext {
     
     func invoke(toolId: String, payload: String) -> String {
         guard let tool = tools[toolId] else {
-            return #"{"error": "Unknown tool: \#(toolId)"}"#
+            return Envelope.failure(.notFound, "Unknown tool: \(toolId)")
         }
         return tool.run(args: payload, runner: runner)
     }
@@ -447,7 +472,7 @@ private func makeCString(_ s: String) -> UnsafePointer<CChar>? {
 
 // MARK: - Manifest
 
-private let manifest = #"""
+let musicManifestJSON = #"""
 {
   "plugin_id": "osaurus.music",
   "name": "Apple Music",
@@ -494,7 +519,7 @@ nonisolated(unsafe) private var api: osr_plugin_api = {
         Unmanaged<PluginContext>.fromOpaque(ctxPtr).release()
     }
     
-    api.get_manifest = { _ in makeCString(manifest) }
+    api.get_manifest = { _ in makeCString(musicManifestJSON) }
     
     api.invoke = { ctxPtr, typePtr, idPtr, payloadPtr in
         guard let ctxPtr, let typePtr, let idPtr, let payloadPtr else { return nil }
@@ -505,7 +530,7 @@ nonisolated(unsafe) private var api: osr_plugin_api = {
         let payload = String(cString: payloadPtr)
         
         guard type == "tool" else {
-            return makeCString(#"{"error": "Unknown capability type: \#(type)"}"#)
+            return makeCString(Envelope.failure(.invalidArgs, "Unknown capability type: \(type)"))
         }
         
         return makeCString(ctx.invoke(toolId: id, payload: payload))
