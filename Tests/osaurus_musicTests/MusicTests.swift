@@ -69,7 +69,8 @@ final class MusicTests: XCTestCase {
         XCTAssertEqual(dict["ok"] as? Bool, false)
         XCTAssertEqual(dict["kind"] as? String, "invalid_args")
         XCTAssertEqual(dict["message"] as? String, message)
-        XCTAssertEqual(dict["retryable"] as? Bool, true)
+        // invalid_args is deterministic — retrying the same arguments cannot succeed
+        XCTAssertEqual(dict["retryable"] as? Bool, false)
     }
 
     func testEnvelopeDefaultRetryablePerKind() throws {
@@ -78,9 +79,10 @@ final class MusicTests: XCTestCase {
             return try XCTUnwrap(object as? [String: Any])
         }
 
-        XCTAssertEqual(try decode(Envelope.failure(.invalidArgs, "x"))["retryable"] as? Bool, true)
+        XCTAssertEqual(try decode(Envelope.failure(.invalidArgs, "x"))["retryable"] as? Bool, false)
         XCTAssertEqual(try decode(Envelope.failure(.executionError, "x"))["retryable"] as? Bool, true)
         XCTAssertEqual(try decode(Envelope.failure(.unavailable, "x"))["retryable"] as? Bool, true)
+        XCTAssertEqual(try decode(Envelope.failure(.timeout, "x"))["retryable"] as? Bool, true)
         XCTAssertEqual(try decode(Envelope.failure(.notFound, "x"))["retryable"] as? Bool, false)
 
         // Explicit override is honored (permission/not-running uses unavailable + retryable:false).

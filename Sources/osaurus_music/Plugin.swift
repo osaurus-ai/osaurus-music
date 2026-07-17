@@ -1,73 +1,82 @@
+import AppKit
 import Foundation
 
 // MARK: - AppleScript Runner
+
+/// How long an osascript invocation may run before it is killed.
+let appleScriptTimeoutSeconds: TimeInterval = 30
+
+/// Classify a nonzero-exit osascript stderr into a runner error. Permission
+/// denials are checked first so a TCC denial is never misreported as
+/// "Music is not running".
+func classifyOsascriptFailure(stderr: String) -> AppleScriptRunner.RunnerError {
+    let lower = stderr.lowercased()
+    if lower.contains("not authorized") || lower.contains("not allowed")
+        || lower.contains("-1743") || lower.contains("permission") {
+        return .permissionDenied
+    }
+    if lower.contains("isn't running") || lower.contains("is not running") || lower.contains("-600") {
+        return .musicNotRunning
+    }
+    return .executionFailed(stderr)
+}
 
 struct AppleScriptRunner {
     enum RunnerError: Error {
         case musicNotRunning
         case permissionDenied
+        case timedOut
         case executionFailed(String)
 
         /// Canonical failure envelope for this error. Permission/not-running map to
-        /// `unavailable` with `retryable: false`; other failures map to `execution_error`.
+        /// `unavailable` with `retryable: false`; timeouts map to `timeout`; other
+        /// failures map to `execution_error`.
         var jsonError: String {
             switch self {
             case .musicNotRunning:
                 return Envelope.failure(.unavailable, "Music app is not running. Please open Apple Music first.", retryable: false)
             case .permissionDenied:
                 return Envelope.failure(.unavailable, "Automation permission denied. Grant Osaurus access in System Settings > Privacy & Security > Automation.", retryable: false)
+            case .timedOut:
+                return Envelope.failure(.timeout, "Music did not respond within \(Int(appleScriptTimeoutSeconds)) seconds and the command was cancelled. Try again.")
             case .executionFailed(let message):
                 return Envelope.failure(.executionError, "Command failed: \(message)")
             }
         }
     }
-    
+
+    /// Whether Music.app is running. Queries the process list directly via
+    /// NSWorkspace: no Apple Events and no TCC involved, so a System Events
+    /// automation denial can no longer be misreported as "Music is not running".
     func isMusicRunning() -> Bool {
-        let script = #"tell application "System Events" to (name of processes) contains "Music""#
-        return runOsascript(script).output.trimmingCharacters(in: .whitespacesAndNewlines) == "true"
+        NSWorkspace.shared.runningApplications.contains {
+            $0.bundleIdentifier == "com.apple.Music"
+        }
     }
-    
+
     func run(_ script: String, requiresMusicRunning: Bool = true) -> Result<String, RunnerError> {
         if requiresMusicRunning && !isMusicRunning() {
             return .failure(.musicNotRunning)
         }
-        
-        let result = runOsascript(script)
-        
-        if result.exitCode != 0 {
-            let stderr = result.error.lowercased()
-            if stderr.contains("not authorized") || stderr.contains("not allowed") {
-                return .failure(.permissionDenied)
-            }
-            if stderr.contains("isn't running") {
-                return .failure(.musicNotRunning)
-            }
-            return .failure(.executionFailed(result.error))
-        }
-        
-        return .success(result.output.trimmingCharacters(in: .whitespacesAndNewlines))
-    }
-    
-    private func runOsascript(_ script: String) -> (output: String, error: String, exitCode: Int32) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = ["-e", script]
-        
-        let outputPipe = Pipe()
-        let errorPipe = Pipe()
-        process.standardOutput = outputPipe
-        process.standardError = errorPipe
-        
+
+        let result: SubprocessResult
         do {
-            try process.run()
-            process.waitUntilExit()
-            
-            let output = String(data: outputPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            let error = String(data: errorPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            return (output, error, process.terminationStatus)
+            result = try runSubprocess(
+                executable: "/usr/bin/osascript", arguments: ["-e", script],
+                timeout: appleScriptTimeoutSeconds)
         } catch {
-            return ("", error.localizedDescription, 1)
+            return .failure(.executionFailed("Failed to launch osascript: \(error.localizedDescription)"))
         }
+
+        if result.timedOut {
+            return .failure(.timedOut)
+        }
+
+        if result.terminationStatus != 0 {
+            return .failure(classifyOsascriptFailure(stderr: result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)))
+        }
+
+        return .success(result.stdout.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 }
 
@@ -161,29 +170,35 @@ private struct GetCurrentTrackTool: Tool {
         let script = """
         tell application "Music"
             if player state is stopped then return "STOPPED"
-            return name of current track & "|||" & artist of current track & "|||" & album of current track & "|||" & duration of current track & "|||" & player position & "|||" & (player state as string)
+            return my encodeField(name of current track) & tab & my encodeField(artist of current track) & tab & my encodeField(album of current track) & tab & duration of current track & tab & player position & tab & (player state as string)
         end tell
+        \(appleScriptFieldEncoderHandlers)
         """
         
         switch runner.run(script) {
         case .success(let output):
-            if output == "STOPPED" {
-                return #"{"playing": false, "message": "No track is currently playing"}"#
-            }
-            
-            let parts = output.components(separatedBy: "|||")
-            guard parts.count >= 6 else {
-                return Envelope.failure(.executionError, "Failed to parse track information")
-            }
-            
-            return """
-            {"playing": true, "track": {"name": "\(parts[0].escapedForJSON)", "artist": "\(parts[1].escapedForJSON)", "album": "\(parts[2].escapedForJSON)", "duration": \(parts[3]), "position": \(parts[4]), "state": "\(parts[5].escapedForJSON)"}}
-            """
-            
+            return renderCurrentTrackJSON(output)
         case .failure(let error):
             return error.jsonError
         }
     }
+}
+
+/// Parse the tab-delimited, field-encoded get_current_track output into JSON.
+func renderCurrentTrackJSON(_ output: String) -> String {
+    if output == "STOPPED" {
+        return #"{"playing": false, "message": "No track is currently playing"}"#
+    }
+
+    let parts = output.components(separatedBy: "\t")
+    guard parts.count >= 6,
+          Double(parts[3]) != nil, Double(parts[4]) != nil else {
+        return Envelope.failure(.executionError, "Failed to parse track information")
+    }
+
+    return """
+    {"playing": true, "track": {"name": "\(decodeAppleScriptField(parts[0]).escapedForJSON)", "artist": "\(decodeAppleScriptField(parts[1]).escapedForJSON)", "album": "\(decodeAppleScriptField(parts[2]).escapedForJSON)", "duration": \(parts[3]), "position": \(parts[4]), "state": "\(parts[5].escapedForJSON)"}}
+    """
 }
 
 private struct GetLibraryStatsTool: Tool {
@@ -192,22 +207,29 @@ private struct GetLibraryStatsTool: Tool {
     func run(args: String, runner: AppleScriptRunner) -> String {
         let script = """
         tell application "Music"
-            return (count of tracks of library playlist 1) & "|||" & (count of playlists)
+            return ((count of tracks of library playlist 1) as text) & tab & ((count of playlists) as text)
         end tell
         """
         
         switch runner.run(script) {
         case .success(let output):
-            let parts = output.components(separatedBy: "|||")
-            guard parts.count >= 2 else {
-                return Envelope.failure(.executionError, "Failed to parse library statistics")
-            }
-            return #"{"tracks": \#(parts[0]), "playlists": \#(parts[1])}"#
-            
+            return renderLibraryStatsJSON(output)
         case .failure(let error):
             return error.jsonError
         }
     }
+}
+
+/// Parse the tab-delimited get_library_stats output into JSON. Counts are
+/// validated as integers so malformed output cannot yield invalid JSON.
+func renderLibraryStatsJSON(_ output: String) -> String {
+    let parts = output.components(separatedBy: "\t")
+    guard parts.count >= 2,
+          let tracks = Int(parts[0].trimmingCharacters(in: .whitespaces)),
+          let playlists = Int(parts[1].trimmingCharacters(in: .whitespaces)) else {
+        return Envelope.failure(.executionError, "Failed to parse library statistics")
+    }
+    return #"{"tracks": \#(tracks), "playlists": \#(playlists)}"#
 }
 
 // MARK: - Search Tools
@@ -230,41 +252,48 @@ private struct SearchSongsTool: Tool {
             return Envelope.failure(.invalidArgs, "Missing required argument 'query'.")
         }
 
-        let limit = input.limit ?? 10
+        if let requested = input.limit, requested < 1 {
+            return Envelope.failure(.invalidArgs, "'limit' must be a positive integer, got \(requested).")
+        }
+        let limit = min(input.limit ?? 10, 100)
         let escapedQuery = input.query.escapedForAppleScript
         
         let script = """
         tell application "Music"
             set searchResults to search library playlist 1 for "\(escapedQuery)" only songs
-            set resultList to {}
+            set output to ""
             repeat with i from 1 to (count of searchResults)
                 if i > \(limit) then exit repeat
                 set t to item i of searchResults
-                set end of resultList to (name of t & "|||" & artist of t & "|||" & album of t)
+                set output to output & my encodeField(name of t) & tab & my encodeField(artist of t) & tab & my encodeField(album of t) & linefeed
             end repeat
-            set AppleScript's text item delimiters to "~~~"
-            return resultList as string
+            return output
         end tell
+        \(appleScriptFieldEncoderHandlers)
         """
         
         switch runner.run(script) {
         case .success(let output):
-            if output.isEmpty {
-                return #"{"results": [], "count": 0}"#
-            }
-            
-            let results = output.components(separatedBy: "~~~").compactMap { track -> String? in
-                let parts = track.components(separatedBy: "|||")
-                guard parts.count >= 3 else { return nil }
-                return #"{"name": "\#(parts[0].escapedForJSON)", "artist": "\#(parts[1].escapedForJSON)", "album": "\#(parts[2].escapedForJSON)"}"#
-            }
-            
-            return #"{"results": [\#(results.joined(separator: ", "))], "count": \#(results.count)}"#
-            
+            return renderSearchResultsJSON(output)
         case .failure(let error):
             return error.jsonError
         }
     }
+}
+
+/// Parse the linefeed/tab-delimited, field-encoded search_songs output into JSON.
+func renderSearchResultsJSON(_ output: String) -> String {
+    if output.isEmpty {
+        return #"{"results": [], "count": 0}"#
+    }
+
+    let results = output.split(separator: "\n").compactMap { track -> String? in
+        let parts = track.components(separatedBy: "\t")
+        guard parts.count >= 3 else { return nil }
+        return #"{"name": "\#(decodeAppleScriptField(parts[0]).escapedForJSON)", "artist": "\#(decodeAppleScriptField(parts[1]).escapedForJSON)", "album": "\#(decodeAppleScriptField(parts[2]).escapedForJSON)"}"#
+    }
+
+    return #"{"results": [\#(results.joined(separator: ", "))], "count": \#(results.count)}"#
 }
 
 private struct PlaySongTool: Tool {
@@ -292,11 +321,12 @@ private struct PlaySongTool: Tool {
                 set theTrack to item 1 of searchResults
                 play theTrack
                 delay 0.5
-                return name of theTrack & "|||" & artist of theTrack & "|||" & (player state as string)
+                return my encodeField(name of theTrack) & tab & my encodeField(artist of theTrack) & tab & (player state as string)
             else
                 return "NOT_FOUND"
             end if
         end tell
+        \(appleScriptFieldEncoderHandlers)
         """
         
         switch runner.run(script) {
@@ -304,22 +334,27 @@ private struct PlaySongTool: Tool {
             if output == "NOT_FOUND" {
                 return Envelope.failure(.notFound, "No song found matching '\(input.song)'")
             }
-            
-            let parts = output.components(separatedBy: "|||")
-            if parts.count >= 3 {
-                let isPlaying = parts[2].lowercased() == "playing"
-                if isPlaying {
-                    return #"{"success": true, "playing": true, "track": {"name": "\#(parts[0].escapedForJSON)", "artist": "\#(parts[1].escapedForJSON)"}}"#
-                } else {
-                    return #"{"success": true, "playing": false, "track": {"name": "\#(parts[0].escapedForJSON)", "artist": "\#(parts[1].escapedForJSON)"}, "message": "Track found but streaming playback requires manual start. Press play in Music app or try play_playlist instead."}"#
-                }
-            }
-            return #"{"success": true, "playing": false, "message": "Track found"}"#
-            
+            return renderPlaySongJSON(output)
         case .failure(let error):
             return error.jsonError
         }
     }
+}
+
+/// Parse the tab-delimited, field-encoded play_song output into JSON.
+func renderPlaySongJSON(_ output: String) -> String {
+    let parts = output.components(separatedBy: "\t")
+    if parts.count >= 3 {
+        let name = decodeAppleScriptField(parts[0]).escapedForJSON
+        let artist = decodeAppleScriptField(parts[1]).escapedForJSON
+        let isPlaying = parts[2].lowercased() == "playing"
+        if isPlaying {
+            return #"{"success": true, "playing": true, "track": {"name": "\#(name)", "artist": "\#(artist)"}}"#
+        } else {
+            return #"{"success": true, "playing": false, "track": {"name": "\#(name)", "artist": "\#(artist)"}, "message": "Track found but streaming playback requires manual start. Press play in Music app or try play_playlist instead."}"#
+        }
+    }
+    return #"{"success": true, "playing": false, "message": "Track found"}"#
 }
 
 private struct PlayPlaylistTool: Tool {
@@ -351,11 +386,12 @@ private struct PlayPlaylistTool: Tool {
                 set shuffle enabled to \(shuffleEnabled)
                 play thePlaylist
                 delay 0.5
-                return (name of thePlaylist) & "|||" & (count of tracks of thePlaylist) & "|||" & (player state as string)
+                return my encodeField(name of thePlaylist) & tab & ((count of tracks of thePlaylist) as text) & tab & (player state as string)
             on error
                 return "NOT_FOUND"
             end try
         end tell
+        \(appleScriptFieldEncoderHandlers)
         """
         
         switch runner.run(script) {
@@ -363,18 +399,21 @@ private struct PlayPlaylistTool: Tool {
             if output == "NOT_FOUND" {
                 return Envelope.failure(.notFound, "Playlist '\(input.playlist)' not found")
             }
-            
-            let parts = output.components(separatedBy: "|||")
-            if parts.count >= 3 {
-                let isPlaying = parts[2].lowercased() == "playing"
-                return #"{"success": true, "playing": \#(isPlaying), "playlist": {"name": "\#(parts[0].escapedForJSON)", "tracks": \#(parts[1])}, "shuffle": \#(shuffleEnabled)}"#
-            }
-            return #"{"success": true}"#
-            
+            return renderPlayPlaylistJSON(output, shuffle: shuffleEnabled)
         case .failure(let error):
             return error.jsonError
         }
     }
+}
+
+/// Parse the tab-delimited, field-encoded play_playlist output into JSON.
+func renderPlayPlaylistJSON(_ output: String, shuffle: Bool) -> String {
+    let parts = output.components(separatedBy: "\t")
+    if parts.count >= 3, let trackCount = Int(parts[1].trimmingCharacters(in: .whitespaces)) {
+        let isPlaying = parts[2].lowercased() == "playing"
+        return #"{"success": true, "playing": \#(isPlaying), "playlist": {"name": "\#(decodeAppleScriptField(parts[0]).escapedForJSON)", "tracks": \#(trackCount)}, "shuffle": \#(shuffle)}"#
+    }
+    return #"{"success": true}"#
 }
 
 private struct ListPlaylistsTool: Tool {
@@ -384,37 +423,53 @@ private struct ListPlaylistsTool: Tool {
         struct Args: Decodable {
             let limit: Int?
         }
-        
-        let input = (try? JSONDecoder().decode(Args.self, from: args.data(using: .utf8) ?? Data()))
-        let limit = input?.limit ?? 25
+
+        var limit = 25
+        let trimmedArgs = args.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedArgs.isEmpty {
+            guard let data = trimmedArgs.data(using: .utf8),
+                  let input = try? JSONDecoder().decode(Args.self, from: data) else {
+                return Envelope.failure(.invalidArgs, "Invalid arguments. Expected: {\"limit\": <positive integer>} or {}")
+            }
+            if let requested = input.limit {
+                guard requested >= 1 else {
+                    return Envelope.failure(.invalidArgs, "'limit' must be a positive integer, got \(requested).")
+                }
+                limit = min(requested, 200)
+            }
+        }
         
         let script = """
         tell application "Music"
-            set playlistNames to {}
+            set output to ""
             set allPlaylists to user playlists
             repeat with i from 1 to (count of allPlaylists)
                 if i > \(limit) then exit repeat
-                set end of playlistNames to name of item i of allPlaylists
+                set output to output & my encodeField(name of item i of allPlaylists) & linefeed
             end repeat
-            set AppleScript's text item delimiters to "~~~"
-            return playlistNames as string
+            return output
         end tell
+        \(appleScriptFieldEncoderHandlers)
         """
         
         switch runner.run(script) {
         case .success(let output):
-            if output.isEmpty {
-                return #"{"playlists": [], "count": 0}"#
-            }
-            
-            let names = output.components(separatedBy: "~~~")
-            let jsonNames = names.map { #""\#($0.escapedForJSON)""# }
-            return #"{"playlists": [\#(jsonNames.joined(separator: ", "))], "count": \#(names.count)}"#
-            
+            return renderPlaylistsJSON(output)
         case .failure(let error):
             return error.jsonError
         }
     }
+}
+
+/// Parse the linefeed-delimited, field-encoded list_playlists output into JSON.
+func renderPlaylistsJSON(_ output: String) -> String {
+    if output.isEmpty {
+        return #"{"playlists": [], "count": 0}"#
+    }
+
+    let names = output.split(separator: "\n").map { decodeAppleScriptField(String($0)) }
+    let jsonNames = names.map { #""\#($0.escapedForJSON)""# }
+    return #"{"playlists": [\#(jsonNames.joined(separator: ", "))], "count": \#(names.count)}"#
 }
 
 // MARK: - Plugin Context
