@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import OsaurusPluginKit
 
 // MARK: - AppleScript Runner
 
@@ -59,9 +60,9 @@ struct AppleScriptRunner {
             return .failure(.musicNotRunning)
         }
 
-        let result: SubprocessResult
+        let result: ProcessRunner.Output
         do {
-            result = try runSubprocess(
+            result = try ProcessRunner.run(
                 executable: "/usr/bin/osascript", arguments: ["-e", script],
                 timeout: appleScriptTimeoutSeconds)
         } catch {
@@ -72,11 +73,11 @@ struct AppleScriptRunner {
             return .failure(.timedOut)
         }
 
-        if result.terminationStatus != 0 {
-            return .failure(classifyOsascriptFailure(stderr: result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)))
+        if result.exitStatus != 0 {
+            return .failure(classifyOsascriptFailure(stderr: result.stderrText.trimmingCharacters(in: .whitespacesAndNewlines)))
         }
 
-        return .success(result.stdout.trimmingCharacters(in: .whitespacesAndNewlines))
+        return .success(result.stdoutText.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 }
 
@@ -508,23 +509,6 @@ class PluginContext {
     }
 }
 
-// MARK: - C ABI
-
-private typealias osr_plugin_ctx_t = UnsafeMutableRawPointer
-
-private struct osr_plugin_api {
-    var free_string: (@convention(c) (UnsafePointer<CChar>?) -> Void)?
-    var `init`: (@convention(c) () -> osr_plugin_ctx_t?)?
-    var destroy: (@convention(c) (osr_plugin_ctx_t?) -> Void)?
-    var get_manifest: (@convention(c) (osr_plugin_ctx_t?) -> UnsafePointer<CChar>?)?
-    var invoke: (@convention(c) (osr_plugin_ctx_t?, UnsafePointer<CChar>?, UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> UnsafePointer<CChar>?)?
-}
-
-private func makeCString(_ s: String) -> UnsafePointer<CChar>? {
-    guard let ptr = strdup(s) else { return nil }
-    return UnsafePointer(ptr)
-}
-
 // MARK: - Manifest
 
 let musicManifestJSON = #"""
@@ -555,6 +539,23 @@ let musicManifestJSON = #"""
   }
 }
 """#
+
+// MARK: - C ABI
+
+private typealias osr_plugin_ctx_t = UnsafeMutableRawPointer
+
+private struct osr_plugin_api {
+    var free_string: (@convention(c) (UnsafePointer<CChar>?) -> Void)?
+    var `init`: (@convention(c) () -> osr_plugin_ctx_t?)?
+    var destroy: (@convention(c) (osr_plugin_ctx_t?) -> Void)?
+    var get_manifest: (@convention(c) (osr_plugin_ctx_t?) -> UnsafePointer<CChar>?)?
+    var invoke: (@convention(c) (osr_plugin_ctx_t?, UnsafePointer<CChar>?, UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> UnsafePointer<CChar>?)?
+}
+
+private func makeCString(_ s: String) -> UnsafePointer<CChar>? {
+    guard let ptr = strdup(s) else { return nil }
+    return UnsafePointer(ptr)
+}
 
 // MARK: - API Implementation
 

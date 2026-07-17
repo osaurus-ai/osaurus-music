@@ -1,5 +1,6 @@
 import XCTest
 import Foundation
+import OsaurusPluginKit
 @testable import osaurus_music
 
 final class MusicTests: XCTestCase {
