@@ -531,7 +531,7 @@ let musicManifestJSON = #"""
 {
   "plugin_id": "osaurus.music",
   "name": "Apple Music",
-  "version": "0.1.0",
+  "version": "1.0.6",
   "description": "Control Apple Music playback, search your library, and get track information",
   "license": "MIT",
   "authors": [],
