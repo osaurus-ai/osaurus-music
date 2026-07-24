@@ -27,7 +27,7 @@ final class MusicTests: XCTestCase {
     func testManifestIsValidJSON() throws {
         let manifest = try parseManifest()
         XCTAssertEqual(manifest["plugin_id"] as? String, "osaurus.music")
-        XCTAssertEqual(manifest["version"] as? String, "1.0.6")
+        XCTAssertEqual(manifest["version"] as? String, "1.1.0")
     }
 
     func testManifestHasTwelveToolsWithIdAndDescription() throws {
