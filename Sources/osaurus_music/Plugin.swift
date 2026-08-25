@@ -474,6 +474,124 @@ func renderPlaylistsJSON(_ output: String) -> String {
     return #"{"playlists": [\#(jsonNames.joined(separator: ", "))], "count": \#(names.count)}"#
 }
 
+/// Hard ceiling on tracks returned by `get_playlist_tracks` in one call.
+let maxPlaylistTracks = 1000
+
+/// Tracks returned when the caller does not specify a limit.
+let defaultPlaylistTracks = 50
+
+/// Resolve the caller's requested track limit: absent means the default, and any
+/// request above the ceiling is clamped rather than rejected.
+func clampPlaylistTrackLimit(_ requested: Int?) -> Int {
+    min(requested ?? defaultPlaylistTracks, maxPlaylistTracks)
+}
+
+private struct GetPlaylistTracksTool: Tool {
+    let name = "get_playlist_tracks"
+
+    func run(args: String, runner: AppleScriptRunner) -> String {
+        struct Args: Decodable {
+            let playlist: String
+            let limit: Int?
+        }
+
+        guard let data = args.data(using: .utf8),
+              let input = try? JSONDecoder().decode(Args.self, from: data) else {
+            return Envelope.failure(.invalidArgs, "Invalid arguments. Expected: {\"playlist\": \"playlist name\"}")
+        }
+
+        guard !input.playlist.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return Envelope.failure(.invalidArgs, "Missing required argument 'playlist'.")
+        }
+
+        if let requested = input.limit, requested < 1 {
+            return Envelope.failure(.invalidArgs, "'limit' must be a positive integer, got \(requested).")
+        }
+        let limit = clampPlaylistTrackLimit(input.limit)
+        let escapedPlaylist = input.playlist.escapedForAppleScript
+
+        let script = """
+        tell application "Music"
+            try
+                set thePlaylist to playlist "\(escapedPlaylist)"
+                set total to count of tracks of thePlaylist
+            on error
+                return "NOT_FOUND"
+            end try
+            if total is 0 then return "0"
+            set n to total
+            if n > \(limit) then set n to \(limit)
+            set ns to name of tracks 1 thru n of thePlaylist
+            set ars to artist of tracks 1 thru n of thePlaylist
+            set als to album of tracks 1 thru n of thePlaylist
+            set ds to duration of tracks 1 thru n of thePlaylist
+            -- A single-element range collapses to a bare value, so a one-track
+            -- playlist would otherwise be iterated character by character.
+            if class of ns is not list then set ns to {ns}
+            if class of ars is not list then set ars to {ars}
+            if class of als is not list then set als to {als}
+            if class of ds is not list then set ds to {ds}
+            -- The four fetches are separate Apple Events; if the playlist is edited
+            -- between them the lists can disagree in length, and an out-of-range
+            -- `item i of` would sink the whole call. Shrink to the shortest.
+            repeat with lst in {ns, ars, als, ds}
+                if (count of lst) < n then set n to (count of lst)
+            end repeat
+            set rows to {}
+            repeat with i from 1 to n
+                set d to item i of ds
+                if d is missing value then set d to 0
+                set end of rows to my safeField(item i of ns) & tab & my safeField(item i of ars) & tab & my safeField(item i of als) & tab & (d as text)
+            end repeat
+            -- Set the delimiter only after the loop: encodeField's replaceAll uses
+            -- text item delimiters internally and would otherwise clobber it.
+            set AppleScript's text item delimiters to linefeed
+            set output to (total as text) & linefeed & (rows as text)
+            set AppleScript's text item delimiters to ""
+            return output
+        end tell
+        on safeField(v)
+            if v is missing value then return ""
+            return my encodeField(v)
+        end safeField
+        \(appleScriptFieldEncoderHandlers)
+        """
+
+        switch runner.run(script) {
+        case .success(let output):
+            if output == "NOT_FOUND" {
+                return Envelope.failure(.notFound, "Playlist '\(input.playlist)' not found")
+            }
+            return renderPlaylistTracksJSON(output)
+        case .failure(let error):
+            return error.jsonError
+        }
+    }
+}
+
+/// Parse the get_playlist_tracks output into JSON. The first line is the playlist's
+/// full track count; each line after it is one tab-delimited, field-encoded track.
+func renderPlaylistTracksJSON(_ output: String) -> String {
+    let lines = output.split(separator: "\n")
+    guard let header = lines.first,
+          let total = Int(header.trimmingCharacters(in: .whitespaces)) else {
+        return Envelope.failure(.executionError, "Failed to parse playlist tracks")
+    }
+
+    let rows = lines.dropFirst()
+    let tracks = rows.compactMap { line -> String? in
+        let parts = line.components(separatedBy: "\t")
+        guard parts.count >= 4, let seconds = Double(parts[3]) else { return nil }
+        let duration = Int(seconds.rounded())
+        return #"{"name": "\#(decodeAppleScriptField(parts[0]).escapedForJSON)", "artist": "\#(decodeAppleScriptField(parts[1]).escapedForJSON)", "album": "\#(decodeAppleScriptField(parts[2]).escapedForJSON)", "duration": \#(duration)}"#
+    }
+
+    // `truncated` answers "are there tracks beyond this page?", so it compares the
+    // rows the script sent against the playlist's real length.
+    let skipped = rows.count - tracks.count
+    return #"{"tracks": [\#(tracks.joined(separator: ", "))], "count": \#(tracks.count), "total": \#(total), "truncated": \#(rows.count < total), "skipped": \#(skipped)}"#
+}
+
 // MARK: - Plugin Context
 
 class PluginContext {
@@ -488,12 +606,13 @@ class PluginContext {
             SimpleCommandTool("previous_track", script: #"tell application "Music" to previous track"#, message: "Went to previous track"),
             SimpleCommandTool("open_music", script: #"tell application "Music" to activate"#, message: "Apple Music opened", requiresMusicRunning: false),
             SetVolumeTool(),
-            
+
             // Information
             GetCurrentTrackTool(),
             GetLibraryStatsTool(),
             ListPlaylistsTool(),
-            
+            GetPlaylistTracksTool(),
+
             // Search
             SearchSongsTool(),
             PlaySongTool(),
@@ -501,7 +620,7 @@ class PluginContext {
         ]
         return Dictionary(uniqueKeysWithValues: toolList.map { ($0.name, $0) })
     }()
-    
+
     func invoke(toolId: String, payload: String) -> String {
         guard let tool = tools[toolId] else {
             return Envelope.failure(.notFound, "Unknown tool: \(toolId)")
@@ -533,6 +652,7 @@ let musicManifestJSON = #"""
       {"id": "get_current_track", "widget": true, "description": "Get currently playing track info", "parameters": {"type": "object", "properties": {}}, "requirements": ["automation"], "permission_policy": "auto"},
       {"id": "get_library_stats", "widget": true, "description": "Get library statistics (track and playlist counts)", "parameters": {"type": "object", "properties": {}}, "requirements": ["automation"], "permission_policy": "auto"},
       {"id": "list_playlists", "widget": true, "description": "List available playlists in the user's library", "parameters": {"type": "object", "properties": {"limit": {"type": "integer", "description": "Max playlists to return (default: 25)"}}}, "requirements": ["automation"], "permission_policy": "auto"},
+      {"id": "get_playlist_tracks", "description": "List the songs in a playlist, with artist, album and duration in whole seconds", "parameters": {"type": "object", "properties": {"playlist": {"type": "string", "description": "Name of the playlist to read"}, "limit": {"type": "integer", "description": "Max tracks to return (default: 50, max: 1000)"}}, "required": ["playlist"]}, "requirements": ["automation"], "permission_policy": "auto"},
       {"id": "search_songs", "description": "Search for songs in your library", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "Search query"}, "limit": {"type": "integer", "description": "Max results (default: 10)"}}, "required": ["query"]}, "requirements": ["automation"], "permission_policy": "auto"},
       {"id": "play_song", "description": "Search and play a specific song", "parameters": {"type": "object", "properties": {"song": {"type": "string", "description": "Song name to search and play"}}, "required": ["song"]}, "requirements": ["automation"], "permission_policy": "ask"},
       {"id": "play_playlist", "description": "Play a playlist by name (more reliable than playing individual songs)", "parameters": {"type": "object", "properties": {"playlist": {"type": "string", "description": "Name of the playlist to play"}, "shuffle": {"type": "boolean", "description": "Whether to shuffle the playlist (default: false)"}}, "required": ["playlist"]}, "requirements": ["automation"], "permission_policy": "ask"}

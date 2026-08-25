@@ -30,9 +30,9 @@ final class MusicTests: XCTestCase {
         XCTAssertEqual(manifest["version"] as? String, "1.1.0")
     }
 
-    func testManifestHasTwelveToolsWithIdAndDescription() throws {
+    func testManifestHasThirteenToolsWithIdAndDescription() throws {
         let tools = try manifestTools()
-        XCTAssertEqual(tools.count, 12, "Expected exactly 12 tools in the manifest")
+        XCTAssertEqual(tools.count, 13, "Expected exactly 13 tools in the manifest")
 
         for tool in tools {
             let id = tool["id"] as? String
@@ -55,7 +55,7 @@ final class MusicTests: XCTestCase {
             registeredIDs,
             "Manifest tool ids must exactly match the registered tool implementations"
         )
-        XCTAssertEqual(registeredIDs.count, 12, "Expected exactly 12 registered tools")
+        XCTAssertEqual(registeredIDs.count, 13, "Expected exactly 13 registered tools")
     }
 
     func testEnvelopeFailureRoundTrip() throws {
