@@ -8,6 +8,7 @@ An Osaurus plugin for controlling Apple Music on macOS.
 - **Playlist Playback**: Play any playlist from your library (recommended for streaming content)
 - **Track Information**: Get details about the currently playing track
 - **Library Search**: Search your music library and play specific songs
+- **Playlist Browsing**: List your playlists and read the songs inside them
 - **Library Stats**: View your library statistics
 
 ## Available Tools
@@ -30,6 +31,7 @@ An Osaurus plugin for controlling Apple Music on macOS.
 | `get_current_track` | Get currently playing track info   | None               |
 | `get_library_stats` | Get library statistics             | None               |
 | `list_playlists`    | List available playlists           | `limit` (optional) |
+| `get_playlist_tracks` | List the songs in a playlist     | `playlist`, `limit` (optional) |
 
 ### Search and Play
 

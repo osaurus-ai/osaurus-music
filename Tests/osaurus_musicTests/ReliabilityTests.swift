@@ -193,6 +193,87 @@ final class OutputParsingTests: XCTestCase {
         XCTAssertEqual(obj["playlists"] as? [String], ["Mix ~~~ 2026", "Road|Trip"])
     }
 
+    func testPlaylistTracksWithHostileMetadata() throws {
+        let rows = [
+            "2",
+            [encodeAppleScriptField("So|ng~1"), encodeAppleScriptField("Ar\ttist"), encodeAppleScriptField("Al\nbum"), "235"].joined(separator: "\t"),
+            [encodeAppleScriptField("Song 2"), encodeAppleScriptField("A2"), encodeAppleScriptField("R2"), "180"].joined(separator: "\t"),
+        ].joined(separator: "\n")
+
+        let obj = try json(renderPlaylistTracksJSON(rows))
+        XCTAssertEqual(obj["count"] as? Int, 2)
+        XCTAssertEqual(obj["total"] as? Int, 2)
+        XCTAssertEqual(obj["truncated"] as? Bool, false)
+        XCTAssertEqual(obj["skipped"] as? Int, 0)
+        let tracks = try XCTUnwrap(obj["tracks"] as? [[String: Any]])
+        XCTAssertEqual(tracks[0]["name"] as? String, "So|ng~1")
+        XCTAssertEqual(tracks[0]["artist"] as? String, "Ar\ttist")
+        XCTAssertEqual(tracks[0]["album"] as? String, "Al\nbum")
+        XCTAssertEqual(tracks[0]["duration"] as? Int, 235)
+    }
+
+    func testPlaylistTracksReportsTruncation() throws {
+        let rows = [
+            "500",
+            [encodeAppleScriptField("Only"), encodeAppleScriptField("A"), encodeAppleScriptField("R"), "100"].joined(separator: "\t"),
+        ].joined(separator: "\n")
+
+        let obj = try json(renderPlaylistTracksJSON(rows))
+        XCTAssertEqual(obj["count"] as? Int, 1)
+        XCTAssertEqual(obj["total"] as? Int, 500)
+        XCTAssertEqual(obj["truncated"] as? Bool, true)
+        XCTAssertEqual(obj["skipped"] as? Int, 0)
+    }
+
+    func testPlaylistTracksEmptyPlaylist() throws {
+        let obj = try json(renderPlaylistTracksJSON("0"))
+        XCTAssertEqual(obj["count"] as? Int, 0)
+        XCTAssertEqual(obj["total"] as? Int, 0)
+        XCTAssertEqual(obj["truncated"] as? Bool, false)
+        XCTAssertEqual(obj["skipped"] as? Int, 0)
+        XCTAssertEqual((obj["tracks"] as? [[String: Any]])?.count, 0)
+    }
+
+    func testPlaylistTracksMalformedHeaderIsError() throws {
+        let obj = try json(renderPlaylistTracksJSON("not-a-number\nSong\tA\tR\t100"))
+        XCTAssertEqual(obj["ok"] as? Bool, false)
+        XCTAssertEqual(obj["kind"] as? String, "execution_error")
+    }
+
+    func testPlaylistTracksSkipsMalformedRows() throws {
+        let rows = ["2", "missing\tfields", ["ok", "A", "R", "90"].joined(separator: "\t")].joined(separator: "\n")
+        let obj = try json(renderPlaylistTracksJSON(rows))
+        XCTAssertEqual(obj["count"] as? Int, 1)
+        XCTAssertEqual(obj["skipped"] as? Int, 1)
+        XCTAssertEqual(
+            obj["truncated"] as? Bool, false,
+            "both rows arrived; a dropped row is not the limit withholding tracks")
+    }
+
+    func testPlaylistTracksRoundsRawDurations() throws {
+        // AppleScript now emits the raw real; Swift owns the rounding.
+        let rows = [
+            "3",
+            ["A", "B", "C", "235.410995483398"].joined(separator: "\t"),
+            ["D", "E", "F", "213.826995849609"].joined(separator: "\t"),
+            ["G", "H", "I", "0"].joined(separator: "\t"),
+        ].joined(separator: "\n")
+
+        let obj = try json(renderPlaylistTracksJSON(rows))
+        let tracks = try XCTUnwrap(obj["tracks"] as? [[String: Any]])
+        XCTAssertEqual(tracks[0]["duration"] as? Int, 235)
+        XCTAssertEqual(tracks[1]["duration"] as? Int, 214, "should round up, not truncate")
+        XCTAssertEqual(tracks[2]["duration"] as? Int, 0, "missing value maps to 0")
+    }
+
+    func testPlaylistTracksRejectsNonNumericDuration() throws {
+        let rows = ["1", ["A", "B", "C", "not-a-number"].joined(separator: "\t")].joined(separator: "\n")
+        let obj = try json(renderPlaylistTracksJSON(rows))
+        XCTAssertEqual(obj["count"] as? Int, 0, "malformed row is skipped, not emitted as null")
+        XCTAssertEqual(obj["skipped"] as? Int, 1)
+        XCTAssertEqual(obj["truncated"] as? Bool, false, "the only row arrived; nothing was withheld")
+    }
+
     func testPlaySongWithHostileMetadata() throws {
         let row = [encodeAppleScriptField("N|1"), encodeAppleScriptField("A~2"), "playing"].joined(separator: "\t")
         let obj = try json(renderPlaySongJSON(row))
@@ -242,6 +323,42 @@ final class ValidationTests: XCTestCase {
     func testListPlaylistsRejectsNonPositiveLimit() {
         let result = ctx.invoke(toolId: "list_playlists", payload: "{\"limit\": -1}")
         XCTAssertTrue(result.contains("\"kind\":\"invalid_args\""), "got: \(result)")
+    }
+
+    func testPlaylistTracksClampsLimitToMax() {
+        XCTAssertEqual(clampPlaylistTrackLimit(5000), maxPlaylistTracks, "over-large limit must be clamped")
+        XCTAssertEqual(clampPlaylistTrackLimit(maxPlaylistTracks + 1), maxPlaylistTracks)
+        XCTAssertEqual(clampPlaylistTrackLimit(maxPlaylistTracks), maxPlaylistTracks, "the ceiling itself is allowed")
+    }
+
+    func testPlaylistTracksUsesDefaultLimitWhenUnspecified() {
+        XCTAssertEqual(clampPlaylistTrackLimit(nil), defaultPlaylistTracks)
+        XCTAssertLessThanOrEqual(defaultPlaylistTracks, maxPlaylistTracks)
+    }
+
+    func testPlaylistTracksPassesThroughLimitsBelowMax() {
+        XCTAssertEqual(clampPlaylistTrackLimit(1), 1)
+        XCTAssertEqual(clampPlaylistTrackLimit(7), 7)
+        XCTAssertEqual(clampPlaylistTrackLimit(maxPlaylistTracks - 1), maxPlaylistTracks - 1)
+    }
+
+    func testPlaylistTracksRejectsMalformedArgs() {
+        let result = ctx.invoke(toolId: "get_playlist_tracks", payload: "not json")
+        XCTAssertTrue(result.contains("\"kind\":\"invalid_args\""), "got: \(result)")
+    }
+
+    func testPlaylistTracksRejectsMissingPlaylist() {
+        for bad in ["{}", "{\"playlist\": \"\"}", "{\"playlist\": \"   \"}"] {
+            let result = ctx.invoke(toolId: "get_playlist_tracks", payload: bad)
+            XCTAssertTrue(result.contains("\"kind\":\"invalid_args\""), "got: \(result)")
+        }
+    }
+
+    func testPlaylistTracksRejectsNonPositiveLimit() {
+        for bad in ["{\"playlist\": \"Mix\", \"limit\": 0}", "{\"playlist\": \"Mix\", \"limit\": -3}"] {
+            let result = ctx.invoke(toolId: "get_playlist_tracks", payload: bad)
+            XCTAssertTrue(result.contains("\"kind\":\"invalid_args\""), "got: \(result)")
+        }
     }
 
     func testSetVolumeStillRejectsOutOfRange() {
